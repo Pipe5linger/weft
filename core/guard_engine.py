@@ -1,4 +1,4 @@
-"""Guard engine — evaluate whether a tool call is allowed in the current step."""
+"""Guard engine - evaluate whether a tool call is allowed in the current step."""
 
 import json
 import os
@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 
 from . import event_store, state_machine
+
+# Standard keys that carry executable commands or scripts in MCP and CLI tool inputs
+COMMAND_KEYS = ("command", "cmd", "script", "query", "eval", "code")
 
 
 def _approved_commands(project_dir: str | None) -> set[str]:
@@ -22,6 +25,72 @@ def _approved_commands(project_dir: str | None) -> set[str]:
         return set()
 
 
+def _extract_command_and_target(tool_name: str, tool_input: dict) -> tuple[str, str | None]:
+    """Extract command text or target file from hook input.
+
+    Inspects Bash, Edit/Write, and MCP tool invocations (mcp__*, ctx_execute, etc.).
+    """
+    if not isinstance(tool_input, dict):
+        return "", None
+
+    # Standard tool types
+    if tool_name == "Bash":
+        return tool_input.get("command", ""), None
+    if tool_name in ("Edit", "Write"):
+        return tool_input.get("file_path", ""), tool_input.get("file_path")
+
+    # MCP tool invocations (e.g. mcp__* or custom execute tools)
+    if tool_name.startswith("mcp__") or "execute" in tool_name.lower():
+        # Look for direct command strings
+        for k in COMMAND_KEYS:
+            val = tool_input.get(k)
+            if isinstance(val, str) and val.strip():
+                return val, None
+
+        # Look for file path edits through MCP tools
+        if "file_path" in tool_input and isinstance(tool_input["file_path"], str):
+            return tool_input["file_path"], tool_input["file_path"]
+
+    return "", None
+
+
+def _log_refusal(tool_name: str, command: str, reason: str, rule: str, project_dir: str | None = None) -> None:
+    """Record refusal telemetry to agentry events stream if configured."""
+    # 1. Weft event store (local project events.jsonl)
+    # Recorded in evaluate() via event_store.append("wf.guard_blocked")
+
+    # 2. Agentry events stream (~/.local/state/agentry/events.jsonl)
+    # Reads build_id / task from AGENT_P_TAGS environment variable if present
+    agentry_dir = Path.home() / ".local" / "state" / "agentry"
+    agent_p_tags = os.environ.get("AGENT_P_TAGS", "")
+    
+    # Extract build_id and task from AGENT_P_TAGS (e.g., 'build_id=xyz,task=abc')
+    tags = {}
+    if agent_p_tags:
+        for part in agent_p_tags.split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                tags[k.strip()] = v.strip()
+
+    payload = {
+        "event": "guard",
+        "tool": tool_name,
+        "refused_input": command,
+        "rule": rule,
+        "reason": reason,
+        "build_id": tags.get("build_id"),
+        "task": tags.get("task"),
+    }
+
+    try:
+        agentry_dir.mkdir(parents=True, exist_ok=True)
+        log_file = agentry_dir / "events.jsonl"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass
+
+
 def evaluate(hook_input: dict, project_dir: str | None = None) -> dict | None:
     """Check if the tool call is blocked by a guard from a non-current step.
 
@@ -32,20 +101,17 @@ def evaluate(hook_input: dict, project_dir: str | None = None) -> dict | None:
         return None
 
     tool_name = hook_input.get("tool_name", "")
-    command = ""
-    if tool_name == "Bash":
-        command = hook_input.get("tool_input", {}).get("command", "")
-    elif tool_name in ("Edit", "Write"):
-        command = hook_input.get("tool_input", {}).get("file_path", "")
+    tool_input = hook_input.get("tool_input", {})
+    command, _ = _extract_command_and_target(tool_name, tool_input)
 
     if not command:
         return None
 
     # Pre-accept escape hatch: an operator-vetted exact command bypasses every guard
-    # for this one run. Exact-match only — if the agent deviates from the approved
+    # for this one run. Exact-match only - if the agent deviates from the approved
     # string at all, it stays blocked. This is the sole path a destructive/publish
     # command reaches the system, and it requires a human's explicit approval.
-    if tool_name == "Bash" and command.strip() in _approved_commands(project_dir):
+    if (tool_name == "Bash" or tool_name.startswith("mcp__")) and command.strip() in _approved_commands(project_dir):
         return None
 
     current_id = state["current_step"]
@@ -74,6 +140,7 @@ def evaluate(hook_input: dict, project_dir: str | None = None) -> dict | None:
                         workflow_id=state["workflow_id"],
                         project_dir=project_dir,
                     )
+                    _log_refusal(tool_name, command, msg, pattern, project_dir)
                     return {"blocked": True, "reason": msg}
             except re.error as e:
                 print(f"[weft] Warning: invalid guard pattern '{pattern}': {e}", file=sys.stderr)
